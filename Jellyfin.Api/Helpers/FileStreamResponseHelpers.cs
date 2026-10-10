@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Net.Http;
 using System.Net.Mime;
 using System.Threading;
@@ -118,7 +119,7 @@ public static class FileStreamResponseHelpers
     }
 
     /// <summary>
-    /// Returns the original clip for a single-file Blu-ray title when its duration matches the title.
+    /// Returns original Blu-ray clip bytes when their combined duration matches the title.
     /// </summary>
     /// <param name="source">The Blu-ray media source.</param>
     /// <param name="mediaEncoder">The media encoder.</param>
@@ -129,46 +130,62 @@ public static class FileStreamResponseHelpers
         MediaSourceInfo source,
         IMediaEncoder mediaEncoder,
         IMemoryCache memoryCache,
-        CancellationToken cancellationToken
-    )
+        CancellationToken cancellationToken)
     {
         var files = mediaEncoder.GetPrimaryPlaylistM2tsFiles(source.Path);
-        if (files is not { Count: 1 } || source.RunTimeTicks is not > 0)
-        {
-            return null;
-        }
-
-        var duration = await GetBlurayClipDuration(
-                files[0],
-                mediaEncoder,
-                memoryCache,
-                cancellationToken
-            )
-            .ConfigureAwait(false);
-        var frameRate = source.VideoStream?.AverageFrameRate ?? source.VideoStream?.RealFrameRate;
-
-        // A single playlist entry may select only part of a clip. Do not serve the whole
-        // file in that case. Allow one video frame for ffprobe/playlist duration rounding.
         if (
-            duration is not > 0
-            || frameRate is not > 0
-            || !float.IsFinite(frameRate.Value)
-            || Math.Abs((double)duration.Value - source.RunTimeTicks.Value)
-                > TimeSpan.TicksPerSecond / frameRate.Value
+            files is not { Count: > 0 }
+            || source.RunTimeTicks is not > 0
+            || files.Distinct(StringComparer.Ordinal).Count() != files.Count
         )
         {
             return null;
         }
 
-        return GetStaticFileResult(files[0], "video/mp2t");
+        double duration = 0;
+        foreach (var file in files)
+        {
+            var clipDuration = await GetBlurayClipDuration(
+                    file,
+                    mediaEncoder,
+                    memoryCache,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (clipDuration is not > 0)
+            {
+                return null;
+            }
+
+            duration += clipDuration.Value;
+        }
+
+        var frameRate = source.VideoStream?.AverageFrameRate ?? source.VideoStream?.RealFrameRate;
+
+        // Prototype guard only: matching duration does not establish exact playlist boundaries
+        // or compatible timestamps/PIDs. Allow one frame per clip for probe rounding.
+        if (
+            frameRate is not > 0
+            || !float.IsFinite(frameRate.Value)
+            || Math.Abs(duration - source.RunTimeTicks.Value)
+                > files.Count * (TimeSpan.TicksPerSecond / frameRate.Value)
+        )
+        {
+            return null;
+        }
+
+        return files.Count == 1
+            ? GetStaticFileResult(files[0], "video/mp2t")
+            : new FileStreamResult(new ConcatenatedFileStream(files), "video/mp2t")
+            {
+                EnableRangeProcessing = true,
+            };
     }
 
     private static async Task<long?> GetBlurayClipDuration(
         string path,
         IMediaEncoder mediaEncoder,
         IMemoryCache memoryCache,
-        CancellationToken cancellationToken
-    )
+        CancellationToken cancellationToken)
     {
         // Serialize probes of the same clip, including concurrent HEAD and Range requests.
         using var acquired = await _blurayProbeLocks
@@ -197,8 +214,7 @@ public static class FileStreamResponseHelpers
                         VideoType = VideoType.VideoFile,
                     },
                 },
-                cancellationToken
-            )
+                cancellationToken)
             .ConfigureAwait(false);
 
         if (info.RunTimeTicks is > 0)

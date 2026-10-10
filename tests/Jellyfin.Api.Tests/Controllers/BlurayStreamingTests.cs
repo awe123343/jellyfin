@@ -259,6 +259,136 @@ public sealed class BlurayStreamingTests : IDisposable
             TestContext.Current.CancellationToken);
 
     [Fact]
+    public async Task Head_MultipleClips_ReturnsCombinedLengthAndReusesProbes()
+    {
+        ConfigureMultipleClips();
+        using var client = _server.CreateClient();
+        for (var i = 0; i < 2; i++)
+        {
+            using var request = new HttpRequestMessage(
+                HttpMethod.Head,
+                $"/Videos/{_itemId}/stream?static=true");
+            using var response = await client.SendAsync(
+                request,
+                TestContext.Current.CancellationToken);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal(16, response.Content.Headers.ContentLength);
+            Assert.Contains("bytes", response.Headers.AcceptRanges);
+            Assert.Empty(
+                await response.Content.ReadAsByteArrayAsync(TestContext.Current.CancellationToken));
+        }
+
+        _encoder.Verify(
+            e => e.GetMediaInfo(It.IsAny<MediaInfoRequest>(), It.IsAny<CancellationToken>()),
+            Times.Exactly(4));
+    }
+
+    [Theory]
+    [InlineData(null, 0, 15)]
+    [InlineData("bytes=2-13", 2, 13)]
+    [InlineData("bytes=3-4", 3, 4)]
+    [InlineData("bytes=4-7", 4, 7)]
+    [InlineData("bytes=14-", 14, 15)]
+    [InlineData("bytes=-2", 14, 15)]
+    public async Task Get_MultipleClips_ReturnsOriginalBytesAcrossBoundaries(
+        string? range,
+        int first,
+        int last)
+    {
+        ConfigureMultipleClips();
+        using var client = _server.CreateClient();
+        using var request = new HttpRequestMessage(
+            HttpMethod.Get,
+            $"/Videos/{_itemId}/stream?static=true");
+        if (range is not null)
+        {
+            request.Headers.Add("Range", range);
+        }
+
+        using var response = await client.SendAsync(request, TestContext.Current.CancellationToken);
+        Assert.Equal(
+            range is null ? HttpStatusCode.OK : HttpStatusCode.PartialContent,
+            response.StatusCode);
+        Assert.Equal(last - first + 1, response.Content.Headers.ContentLength);
+        var bytes = await response.Content.ReadAsByteArrayAsync(
+            TestContext.Current.CancellationToken);
+        Assert.Equal(last - first + 1, bytes.Length);
+        for (var i = 0; i < bytes.Length; i++)
+        {
+            Assert.Equal(first + i, bytes[i]);
+        }
+
+        if (range is not null)
+        {
+            Assert.Equal(
+                $"bytes {first}-{last}/16",
+                response.Content.Headers.ContentRange?.ToString());
+        }
+
+        _encoder.Verify(
+            e => e.GenerateConcatConfig(It.IsAny<MediaSourceInfo>(), It.IsAny<string>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task Get_MultipleClips_RangeBeyondEnd_Returns416()
+    {
+        ConfigureMultipleClips();
+        using var client = _server.CreateClient();
+        using var request = new HttpRequestMessage(
+            HttpMethod.Get,
+            $"/Videos/{_itemId}/stream?static=true");
+        request.Headers.Add("Range", "bytes=16-");
+        using var response = await client.SendAsync(request, TestContext.Current.CancellationToken);
+        Assert.Equal(HttpStatusCode.RequestedRangeNotSatisfiable, response.StatusCode);
+        Assert.Equal("bytes */16", response.Content.Headers.ContentRange?.ToString());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Head_MultipleClips_UnknownOrMismatchedDuration_KeepsProgressiveResponse(
+        bool unknown)
+    {
+        ConfigureMultipleClips();
+        if (unknown)
+        {
+            _encoder
+                .Setup(e =>
+                    e.GetMediaInfo(It.IsAny<MediaInfoRequest>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new MediaInfo());
+        }
+        else
+        {
+            _source.RunTimeTicks -= TimeSpan.FromSeconds(1).Ticks;
+        }
+
+        await AssertProgressiveHead();
+    }
+
+    private void ConfigureMultipleClips()
+    {
+        var files = new List<string>();
+        for (var i = 0; i < 4; i++)
+        {
+            var path = Path.Combine(_directory, $"part{i}.m2ts");
+            File.WriteAllBytes(
+                path,
+                new byte[]
+                {
+                    (byte)(i * 4),
+                    (byte)((i * 4) + 1),
+                    (byte)((i * 4) + 2),
+                    (byte)((i * 4) + 3),
+                });
+            files.Add(path);
+        }
+
+        _encoder.Setup(e => e.GetPrimaryPlaylistM2tsFiles(_directory)).Returns(files);
+        _source.RunTimeTicks = TimeSpan.FromSeconds(240).Ticks;
+    }
+
+    [Fact]
     public async Task Head_SingleClip_ReturnsActualLengthAndRangeSupport()
     {
         using var client = _server.CreateClient();
